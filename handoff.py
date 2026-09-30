@@ -516,11 +516,14 @@ def _extract_clarify_response(raw: Any) -> str:
 
 def _clarify_looks_failed(response: str) -> Optional[dict[str, str]]:
     low = response.strip()
+    flat = low.lower()
     if not low:
         return {"status": "failed", "detail": "empty"}
-    if low.startswith("[user did not respond"):
+    if flat.startswith("[user did not respond") or flat.startswith(
+        "the user did not provide a response"
+    ):
         return {"status": "failed", "detail": "timed out"}
-    if low.startswith("[clarify") or "not available" in low.lower():
+    if low.startswith("[clarify") or "not available" in flat:
         return {"status": "failed", "detail": "clarify unavailable"}
     return None
 
