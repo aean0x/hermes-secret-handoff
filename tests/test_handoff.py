@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -269,6 +272,132 @@ class NeverReturnsSecret(unittest.TestCase):
         self.assertNotIn(secret, out)
         self.assertNotIn(secret, json.dumps(data))
         self.assertIsNone(h.peek_pending("cli"))
+
+
+class BoundedPromptWait(unittest.TestCase):
+    """A prompt that is raised but never answered must fail the tool, not the turn."""
+
+    def setUp(self) -> None:
+        h.reset_state()
+
+    def tearDown(self) -> None:
+        h.reset_state()
+
+    def test_dead_prompt_fails_fast_with_a_fallback(self) -> None:
+        secret = _sentinel("never-arrives")
+        entered = threading.Event()
+        released = threading.Event()
+        self.addCleanup(released.set)
+
+        def hanging_clarify(**_kwargs):
+            entered.set()
+            released.wait(30)  # the platform owns its own, far longer, wait
+            return json.dumps({"user_response": secret})
+
+        def fake_inject(*_a, **_k):  # pragma: no cover
+            raise AssertionError("nothing may be injected without a reply")
+
+        started = time.monotonic()
+        with (
+            patch.dict(os.environ, {"SECRET_HANDOFF_PROMPT_TIMEOUT_S": "1"}),
+            patch.object(h, "resolve_session_key_for_tool", return_value="webui-session"),
+            patch.object(h, "inject_secret", side_effect=fake_inject),
+        ):
+            _install_clarify(hanging_clarify)
+            out = h.handle_request_secret({"service": "check24.de"})
+        elapsed = time.monotonic() - started
+
+        data = json.loads(out)
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["detail"], "no_response")
+        self.assertIn("fallback", data)
+        self.assertLess(elapsed, 20.0)
+        self.assertTrue(entered.is_set(), "the prompt must be raised before giving up")
+        self.assertNotIn(secret, out)
+        self.assertIsNone(h.peek_pending("webui-session"))
+
+    def test_reply_inside_the_budget_still_injects(self) -> None:
+        secret = _sentinel("answered")
+        captured: list[str] = []
+
+        def fake_clarify(**_kwargs):
+            return json.dumps({"user_response": secret})
+
+        def fake_inject(text: str, **_kwargs) -> tuple[bool, str]:
+            captured.append(text)
+            return True, "injected"
+
+        with (
+            patch.dict(os.environ, {"SECRET_HANDOFF_PROMPT_TIMEOUT_S": "30"}),
+            patch.object(h, "resolve_session_key_for_tool", return_value="webui-session"),
+            patch.object(h, "inject_secret", side_effect=fake_inject),
+        ):
+            _install_clarify(fake_clarify)
+            out = h.handle_request_secret({"service": "check24.de"})
+
+        data = json.loads(out)
+        self.assertEqual(data["status"], "ok")
+        self.assertEqual(captured, [secret])
+        self.assertNotIn(secret, out)
+
+    def test_resolved_callback_that_never_answers_returns_status_fast(self) -> None:
+        """The live shape: the turn's own callback is resolved, the prompt is
+        raised through clarify, and this session's surface never answers it."""
+        entered = threading.Event()
+        released = threading.Event()
+        self.addCleanup(released.set)
+
+        def webui_like_callback(question, choices):
+            entered.set()
+            released.wait(30)  # raised, visible or not, and never answered
+            return "The user did not provide a response within the time limit."
+
+        def clarify_via_callback(question=None, choices=None, callback=None):
+            return callback(question, choices)
+
+        started = time.monotonic()
+        with (
+            patch.dict(os.environ, {"SECRET_HANDOFF_PROMPT_TIMEOUT_S": "1"}),
+            patch.object(h, "resolve_session_key_for_tool", return_value="webui-session"),
+            patch.object(
+                h, "_find_clarify_callback_from_stack", return_value=webui_like_callback
+            ),
+            patch.object(h, "inject_secret", side_effect=AssertionError("no reply, no inject")),
+        ):
+            _install_clarify(clarify_via_callback)
+            out = h.handle_request_secret({"service": "check24.de"})
+        elapsed = time.monotonic() - started
+
+        data = json.loads(out)
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["detail"], "no_response")
+        self.assertEqual(data["service"], "check24.de")
+        self.assertLess(elapsed, 20.0)
+        self.assertTrue(entered.is_set())
+        self.assertIsNone(h.peek_pending("webui-session"))
+
+    def test_tool_timeout_stays_above_the_prompt_budget(self) -> None:
+        with patch.dict(os.environ, {"SECRET_HANDOFF_PROMPT_TIMEOUT_S": "600"}):
+            self.assertGreater(h._prompt_timeout_s() + h._PROMPT_SLACK_S, 600.0)
+            self.assertEqual(h._prompt_timeout_s(), 600.0)
+
+    def test_fallback_hint_is_host_supplied_when_set(self) -> None:
+        with patch.dict(os.environ, {"SECRET_HANDOFF_FALLBACK_HINT": "https://example.test/cast"}):
+            self.assertEqual(h._fallback_hint(), "https://example.test/cast")
+        self.assertEqual(h._fallback_hint(), h.FALLBACK_HINT)
+
+    def test_prompt_budget_zero_means_no_cap(self) -> None:
+        def fake_clarify(**_kwargs):
+            return json.dumps({"user_response": "x"})
+
+        with patch.dict(os.environ, {"SECRET_HANDOFF_PROMPT_TIMEOUT_S": "0"}):
+            self.assertEqual(h._prompt_timeout_s(), 0.0)
+            _install_clarify(fake_clarify)
+            started = time.monotonic()
+            raw, timed_out = h._clarify_with_deadline("q", lambda *_a, **_k: "x", 0)
+        self.assertFalse(timed_out)
+        self.assertIn("x", raw)
+        self.assertLess(time.monotonic() - started, 5.0)
 
 
 if __name__ == "__main__":

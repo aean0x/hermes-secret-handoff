@@ -43,11 +43,36 @@ All optional; the endpoint falls back to the host's configured browser.
 | `BROWSER_CDP_URL` | – | CDP endpoint. The standard Hermes variable; checked first. |
 | `SECRET_HANDOFF_CDP_URL` | loopback `:9222` | Fallback endpoint for this plugin only, used when neither an explicit `browser.cdp_url` nor `BROWSER_CDP_URL` is set. |
 | `SECRET_HANDOFF_CDP_TIMEOUT_S` | `8` | Per-websocket open/timeout budget for one injection. |
-| `SECRET_HANDOFF_TOOL_TIMEOUT_S` | `300` | Overall tool timeout; the human may take a while to paste. |
+| `SECRET_HANDOFF_PROMPT_TIMEOUT_S` | `90` | How long one clarify prompt may take before the tool gives up and reports `no_response`. `0` disables the cap. |
+| `SECRET_HANDOFF_FALLBACK_HINT` | – | Host-supplied pointer carried by a bounded failure, so the caller knows which surface to switch to. |
+| `SECRET_HANDOFF_TOOL_TIMEOUT_S` | `300` | Overall tool timeout; the human may take a while to paste. Always kept above the prompt budget. |
 | `HERMES_SESSION_KEY` | – | Session the pending request belongs to; set by Hermes. |
 
 Resolution order for the endpoint: explicit tool argument → `BROWSER_CDP_URL` →
 `browser.cdp_url` in `config.yaml` → `SECRET_HANDOFF_CDP_URL` → loopback `:9222`.
+
+## When the prompt is not answered
+
+The prompt budget exists because the host owns its own, longer, wait: on a
+surface where the prompt is raised but never rendered or answered, stock
+clarify returns nothing at all and the *host's* tool ceiling ends the call —
+420 s in the observed WebUI case, with a generic error and no usable result.
+
+Past the budget the tool returns immediately:
+
+```json
+{"status": "failed", "service": "check24.de", "detail": "no_response", "fallback": "…"}
+```
+
+`no_response` is a statement about the surface, not about the human: the reply
+never arrived, so nothing was injected and the value was discarded. The caller
+must not re-raise the same prompt in the same session — it switches surface
+instead, to the browser cast UI or whatever `SECRET_HANDOFF_FALLBACK_HINT`
+names, so the human can type into the page himself.
+
+A prompt abandoned this way may stay visible in the session's UI for a while;
+answering it later is harmless (the reply is discarded, and the platform clears
+it on its own timeout).
 
 ## Security model
 
@@ -65,12 +90,14 @@ Resolution order for the endpoint: explicit tool argument → `BROWSER_CDP_URL` 
 ## Tests
 
 ```bash
-python -m pytest tests/ -q
+python3 -m unittest discover -s tests
 ```
 
 Pure unit tests — stock CPython, no Hermes runtime, no CDP, no network. They
 cover reply classification, endpoint resolution, the clarify round-trip, the
-never-return-the-secret invariant for inject/cancel/timeout/failure, and the
+never-return-the-secret invariant for inject/cancel/timeout/failure, the
+bounded prompt wait (a prompt that is raised and never answered must fail the
+tool in seconds, with `no_response` and a fallback), and the
 `request_secret` schema.
 
 ## License
