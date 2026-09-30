@@ -22,7 +22,22 @@ logger = logging.getLogger("hermes.plugins.secret_handoff")
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 TOOL_TIMEOUT_S = 300.0
+PROMPT_TIMEOUT_S = 90.0
+_PROMPT_SLACK_S = 30.0
 _CDP_TIMEOUT_S = 8.0
+
+# Carried by a bounded failure so the caller changes surface instead of
+# re-raising the same prompt that produced nothing. Overridable per host.
+FALLBACK_HINT = (
+    "No reply arrived inside the prompt budget. Do not retry request_secret in "
+    "this session — its prompt may not be visible there. Switch to the browser "
+    "cast UI, or any surface where the human can type into the page himself."
+)
+
+
+def _fallback_hint() -> str:
+    """Host-supplied pointer for the bounded-failure path."""
+    return os.environ.get("SECRET_HANDOFF_FALLBACK_HINT", "").strip() or FALLBACK_HINT
 
 
 def _env_float(name: str, default: float) -> float:
@@ -447,7 +462,10 @@ REQUEST_SECRET_SCHEMA: dict[str, Any] = {
         "collects the reply; the plugin injects it via a direct CDP websocket "
         "and returns only a status JSON — the secret never enters the "
         "transcript or model context. Do not ask the user to paste a password "
-        "in chat."
+        "in chat. A result of {\"status\": \"failed\", \"detail\": "
+        "\"no_response\"} means the prompt went unanswered in this session — "
+        "do not retry it; switch to the cast UI so the human can type into "
+        "the page himself."
     ),
     "parameters": {
         "type": "object",
@@ -507,6 +525,43 @@ def _clarify_looks_failed(response: str) -> Optional[dict[str, str]]:
     return None
 
 
+def _prompt_timeout_s() -> float:
+    """Budget for one clarify round-trip. ``<= 0`` means wait without a cap."""
+    return _env_float("SECRET_HANDOFF_PROMPT_TIMEOUT_S", PROMPT_TIMEOUT_S)
+
+
+def _clarify_with_deadline(
+    question: str, callback: Optional[Callable], timeout_s: float
+) -> tuple[Any, bool]:
+    """Ask through stock clarify, but never block past ``timeout_s``.
+
+    The platform callback owns its own wait, which can outlive the host's tool
+    ceiling: on a surface where the prompt is raised but never answered, the
+    callback returns nothing at all and the *host* ends the call with a generic
+    timeout, long after the turn was useful. This bound keeps the decision in
+    the plugin. Returns ``(raw, timed_out)``; ``timed_out`` True means no reply
+    arrived inside the budget and the caller must fail fast.
+    """
+    from tools.clarify_tool import clarify_tool
+
+    result: dict[str, Any] = {}
+
+    def _ask() -> None:
+        try:
+            result["raw"] = clarify_tool(question=question, choices=None, callback=callback)
+        except BaseException as exc:  # re-raised on the caller's thread
+            result["error"] = exc
+
+    worker = threading.Thread(target=_ask, name="secret-handoff-prompt", daemon=True)
+    worker.start()
+    worker.join(None if timeout_s <= 0 else timeout_s)
+    if worker.is_alive():
+        return None, True
+    if "error" in result:
+        raise result["error"]
+    return result.get("raw"), False
+
+
 def handle_request_secret(args: dict, **kwargs: Any) -> str:
     service = str((args or {}).get("service") or "").strip()
     if not service:
@@ -531,19 +586,45 @@ def handle_request_secret(args: dict, **kwargs: Any) -> str:
     )
 
     question = f"Password for {service}. {_QUESTION}"
-    callback = kwargs.get("callback") or _find_clarify_callback(session_key)
+    callback = kwargs.get("callback")
+    if callback is None:
+        callback = _find_clarify_callback_from_stack()
+        source = "stack"
+        if callback is None:
+            callback = _find_clarify_callback_on_heap(session_key)
+            source = "heap" if callback is not None else "none"
+        logger.info(
+            "secret-handoff: clarify callback resolved via %s (session=%s)", source, session_key
+        )
 
     raw: Any = ""
     response = ""
     try:
         try:
-            from tools.clarify_tool import clarify_tool
-
-            raw = clarify_tool(question=question, choices=None, callback=callback)
+            raw, prompt_timed_out = _clarify_with_deadline(
+                question, callback, _prompt_timeout_s()
+            )
         except Exception:
             logger.warning("secret-handoff: clarify_tool failed")
             return json.dumps(
                 {"status": "failed", "service": service, "detail": "clarify unavailable"}
+            )
+
+        if prompt_timed_out:
+            logger.warning(
+                "secret-handoff: no reply inside %.0fs for %s (session=%s); "
+                "the prompt is raised but this session's surface never answered it",
+                _prompt_timeout_s(),
+                service,
+                session_key,
+            )
+            return json.dumps(
+                {
+                    "status": "failed",
+                    "service": service,
+                    "detail": "no_response",
+                    "fallback": _fallback_hint(),
+                }
             )
 
         response = _extract_clarify_response(raw)
@@ -599,7 +680,10 @@ def _register_tool(ctx: Any) -> None:
         "handler": handle_request_secret,
         "schema": REQUEST_SECRET_SCHEMA,
         "toolset": "plugin",
-        "timeout_s": _env_float("SECRET_HANDOFF_TOOL_TIMEOUT_S", TOOL_TIMEOUT_S),
+        "timeout_s": max(
+            _env_float("SECRET_HANDOFF_TOOL_TIMEOUT_S", TOOL_TIMEOUT_S),
+            _prompt_timeout_s() + _PROMPT_SLACK_S,
+        ),
         "description": REQUEST_SECRET_SCHEMA["description"],
         "emoji": "🔐",
     }
