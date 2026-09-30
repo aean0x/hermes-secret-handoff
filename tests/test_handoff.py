@@ -248,6 +248,39 @@ class NeverReturnsSecret(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(data))
         self.assertIsNone(h.peek_pending("cli"))
 
+    def test_platform_timeout_sentinel_is_never_injected(self) -> None:
+        """A timed-out prompt must not have its sentinel typed into the page.
+
+        Covers both the stock sentinel and the copy the WebUI returns from its
+        own clarify wait.
+        """
+        captured: list[str] = []
+
+        def fake_inject(text: str, **_kwargs) -> tuple[bool, str]:
+            captured.append(text)
+            return True, "injected"
+
+        for sentinel in (
+            "The user did not provide a response within the time limit.",
+            "The user did not provide a response within the time limit. "
+            "Use your best judgement to make the choice and proceed.",
+        ):
+            with self.subTest(sentinel=sentinel[:40]):
+
+                def fake_clarify(**_kwargs):
+                    return json.dumps({"user_response": sentinel})
+
+                with (
+                    patch.object(h, "resolve_session_key_for_tool", return_value="gateway"),
+                    patch.object(h, "inject_secret", side_effect=fake_inject),
+                ):
+                    _install_clarify(fake_clarify)
+                    out = h.handle_request_secret({"service": "example.com"})
+                data = json.loads(out)
+                self.assertEqual(data["status"], "failed", data)
+                self.assertEqual(data["detail"], "timed out", data)
+        self.assertEqual(captured, [])
+
     def test_inject_failure_omits_secret(self) -> None:
         secret = _sentinel("inject-fail")
 
