@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger("hermes.plugins.secret_handoff")
@@ -236,6 +237,39 @@ def resolve_cdp_http_base(explicit: Optional[str] = None) -> str:
     return os.environ.get("SECRET_HANDOFF_CDP_URL", "").strip() or DEFAULT_CDP_URL
 
 
+def _host(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _is_loopback(url: str) -> bool:
+    host = _host(url)
+    return host in {"localhost", "::1"} or host.startswith("127.")
+
+
+def page_origin(url: str) -> str:
+    """``scheme://host[:port]`` of a target URL, or ``""`` when it has none."""
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        return ""
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return ""
+    return f"{parts.scheme}://{parts.netloc.rsplit('@', 1)[-1]}"
+
+
+def origin_matches_service(origin: str, service: str) -> bool:
+    """True when the page host is ``service``'s domain or a subdomain of it."""
+    host = _host(origin)
+    raw = (service or "").strip().lower()
+    want = _host(raw if "://" in raw else "https://" + raw)
+    if not host or not want:
+        return False
+    return host == want or host.endswith("." + want)
+
+
 def _http_json(url: str, timeout: float = 3.0) -> Any:
     req = Request(url, headers={"Accept": "application/json"})
     with urlopen(req, timeout=timeout) as resp:
@@ -286,8 +320,13 @@ async def _cdp_session_call(
     *,
     attach_target_id: Optional[str] = None,
     timeout: Optional[float] = None,
+    guard: Optional[Callable[[Any], bool]] = None,
 ) -> list[Any]:
-    """Open one CDP websocket, optionally attach, run methods, return results."""
+    """Open one CDP websocket, optionally attach, run methods, return results.
+
+    When *guard* is given it sees the first call's result; ``False`` aborts
+    before any later call (the text insertion) is sent.
+    """
     import websockets
 
     if timeout is None:
@@ -336,6 +375,8 @@ async def _cdp_session_call(
 
         for method, params in calls:
             results.append(await _rpc(method, params))
+            if guard is not None and len(results) == 1 and not guard(results[0]):
+                raise _GuardRefused()
     return results
 
 
@@ -355,10 +396,14 @@ def _eval_length_expr() -> str:
 
 
 def _eval_focus_expr() -> str:
+    """Report the live origin and whether focus is on a password-type input."""
     return (
-        "(function(){var el=document.activeElement;"
-        "if(el&&typeof el.focus==='function'){el.focus();return true;}"
-        "return false;})()"
+        "(function(){var el=document.activeElement,ok=false;"
+        "if(el&&el.tagName==='INPUT'){var t=(el.type||'').toLowerCase(),"
+        "ac=(el.getAttribute('autocomplete')||'').toLowerCase();"
+        "ok=t==='password'||/password|one-time-code/.test(ac);}"
+        "if(ok&&typeof el.focus==='function')el.focus();"
+        "return {origin:location.origin,field:ok};})()"
     )
 
 
@@ -375,28 +420,30 @@ def _length_from_eval(result: Any) -> int:
         return 0
 
 
-def inject_secret(
-    secret: str,
-    *,
+def _plan_target(
     cdp_url: Optional[str] = None,
     target_id: Optional[str] = None,
     frame_id: Optional[str] = None,
-) -> tuple[bool, str]:
-    """Type *secret* into the focused field over a direct CDP websocket."""
-    if not secret:
-        return False, "empty secret"
+) -> tuple[Optional[dict[str, Any]], str]:
+    """Resolve the CDP target: ``({ws_url, attach_id, origin}, "")`` or ``(None, detail)``.
+
+    The endpoint must be loopback unless it is the operator-configured one, and
+    the websocket the endpoint hands back must stay on the same host.
+    """
     base = resolve_cdp_http_base(cdp_url)
+    if not _is_loopback(base) and base != resolve_cdp_http_base(None):
+        return None, "cdp endpoint not allowed"
     try:
         targets = _http_json(base + "/json")
     except (URLError, OSError, TimeoutError, json.JSONDecodeError, ValueError):
         logger.warning("secret-handoff: CDP target list failed")
-        return False, "cdp unavailable"
+        return None, "cdp unavailable"
     if not isinstance(targets, list):
-        return False, "cdp unavailable"
+        return None, "cdp unavailable"
 
     target = pick_target(targets, target_id=target_id, frame_id=frame_id)
     if target is None:
-        return False, "no target"
+        return None, "no target"
     ws_url = str(target.get("webSocketDebuggerUrl") or "").strip()
     attach_id: Optional[str] = None
     if not ws_url:
@@ -411,7 +458,58 @@ def inject_secret(
         attach_id = frame_id
 
     if not ws_url:
-        return False, "cdp unavailable"
+        return None, "cdp unavailable"
+    if not (_is_loopback(ws_url) or _host(ws_url) == _host(base)):
+        return None, "cdp endpoint not allowed"
+    origin = page_origin(str(target.get("url") or ""))
+    return {"ws_url": ws_url, "attach_id": attach_id, "origin": origin}, ""
+
+
+def describe_target(
+    target_id: Optional[str] = None, frame_id: Optional[str] = None
+) -> tuple[bool, str]:
+    """``(True, origin)`` of the page the secret would be typed into, else ``(False, detail)``."""
+    plan, detail = _plan_target(None, target_id=target_id, frame_id=frame_id)
+    if plan is None:
+        return False, detail
+    if not plan["origin"]:
+        return False, "target has no web origin"
+    return True, plan["origin"]
+
+
+class _GuardRefused(Exception):
+    """The page changed origin, or focus is not on a password field."""
+
+
+def inject_secret(
+    secret: str,
+    *,
+    cdp_url: Optional[str] = None,
+    target_id: Optional[str] = None,
+    frame_id: Optional[str] = None,
+    expected_origin: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Type *secret* into the focused password field over a direct CDP websocket.
+
+    Nothing is typed unless the page's live ``location.origin`` equals
+    *expected_origin* (when given) and focus is on a password / one-time-code input.
+    """
+    if not secret:
+        return False, "empty secret"
+    plan, detail = _plan_target(cdp_url, target_id=target_id, frame_id=frame_id)
+    if plan is None:
+        return False, detail
+    ws_url, attach_id = plan["ws_url"], plan["attach_id"]
+    expected = expected_origin or plan["origin"]
+
+    def _guard(result: Any) -> bool:
+        value = (result or {}).get("result", {}).get("value") if isinstance(result, dict) else None
+        return (
+            isinstance(value, dict)
+            and bool(expected)
+            and value.get("origin") == expected
+            and value.get("field") is True
+        )
 
     focus_call = ("Runtime.evaluate", {"expression": _eval_focus_expr(), "returnByValue": True})
     insert_call = ("Input.insertText", {"text": secret})
@@ -424,6 +522,7 @@ def inject_secret(
                 ws_url,
                 [focus_call, insert_call, len_call],
                 attach_target_id=attach_id,
+                guard=_guard,
             )
         )
         length = _length_from_eval(results[-1] if results else None)
@@ -434,12 +533,16 @@ def inject_secret(
                 ws_url,
                 [focus_call, *char_calls, len_call],
                 attach_target_id=attach_id,
+                guard=_guard,
             )
         )
         length = _length_from_eval(results[-1] if results else None)
         if length > 0:
             return True, "injected"
         return False, "field still empty"
+    except _GuardRefused:
+        logger.warning("secret-handoff: page origin changed or focus is not a password field")
+        return False, "not a password field on the expected origin"
     except Exception:
         logger.warning("secret-handoff: CDP inject failed")
         return False, "inject failed"
@@ -472,7 +575,10 @@ REQUEST_SECRET_SCHEMA: dict[str, Any] = {
         "properties": {
             "service": {
                 "type": "string",
-                "description": "Site or account name (e.g. example.com).",
+                "description": (
+                    "Domain of the site (e.g. example.com). The secret is only "
+                    "typed into a page whose host is this domain or a subdomain."
+                ),
             },
             "target_id": {
                 "type": "string",
@@ -481,10 +587,6 @@ REQUEST_SECRET_SCHEMA: dict[str, Any] = {
             "frame_id": {
                 "type": "string",
                 "description": "OOPIF frame id (same constraint as browser_cdp).",
-            },
-            "cdp_url": {
-                "type": "string",
-                "description": "Optional explicit CDP endpoint. Defaults to BROWSER_CDP_URL / :9222.",
             },
         },
         "required": ["service"],
@@ -499,19 +601,36 @@ def _opt_str(value: Any) -> Optional[str]:
     return text or None
 
 
+def _from_responses(data: dict) -> str:
+    """Current clarify shape: ``{"responses": [{"user_response"}], "outcome"}``."""
+    outcome = str(data.get("outcome") or "")
+    if outcome == "timed_out":
+        return "[user did not respond in time]"
+    if outcome == "cancelled":
+        return "cancel"
+    if outcome == "undelivered":
+        return "[clarify undelivered]"
+    first = data["responses"][0] if data["responses"] else None
+    value = first.get("user_response") if isinstance(first, dict) else None
+    return value if isinstance(value, str) else ""
+
+
 def _extract_clarify_response(raw: Any) -> str:
     if raw is None:
         return ""
     if isinstance(raw, dict):
-        return str(raw.get("user_response") or "")
-    text = str(raw)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return text.strip()
+        data: Any = raw
+    else:
+        text = str(raw)
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return text.strip()
     if isinstance(data, dict):
+        if isinstance(data.get("responses"), list):
+            return _from_responses(data)
         return str(data.get("user_response") or "")
-    return text.strip()
+    return str(raw).strip()
 
 
 def _clarify_looks_failed(response: str) -> Optional[dict[str, str]]:
@@ -533,6 +652,14 @@ def _prompt_timeout_s() -> float:
     return _env_float("SECRET_HANDOFF_PROMPT_TIMEOUT_S", PROMPT_TIMEOUT_S)
 
 
+def _takes_questions(fn: Callable) -> bool:
+    """Current Hermes clarify takes ``questions=[...]``; older releases ``question=``."""
+    try:
+        return "questions" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _clarify_with_deadline(
     question: str, callback: Optional[Callable], timeout_s: float
 ) -> tuple[Any, bool]:
@@ -551,7 +678,10 @@ def _clarify_with_deadline(
 
     def _ask() -> None:
         try:
-            result["raw"] = clarify_tool(question=question, choices=None, callback=callback)
+            if _takes_questions(clarify_tool):
+                result["raw"] = clarify_tool(questions=[{"question": question}], callback=callback)
+            else:  # older Hermes: clarify_tool(question, choices, callback)
+                result["raw"] = clarify_tool(question=question, choices=None, callback=callback)
         except BaseException as exc:  # re-raised on the caller's thread
             result["error"] = exc
 
@@ -575,7 +705,21 @@ def handle_request_secret(args: dict, **kwargs: Any) -> str:
     session_key = resolve_session_key_for_tool(**kwargs)
     target_id = _opt_str((args or {}).get("target_id"))
     frame_id = _opt_str((args or {}).get("frame_id"))
-    cdp_url = _opt_str((args or {}).get("cdp_url"))
+
+    # Bind the prompt to the real page before asking: the human sees where the
+    # value will be typed, and a page on another site is refused outright.
+    found, origin = describe_target(target_id=target_id, frame_id=frame_id)
+    if not found:
+        return json.dumps({"status": "failed", "service": service, "detail": origin})
+    if not origin_matches_service(origin, service):
+        return json.dumps(
+            {
+                "status": "failed",
+                "service": service,
+                "detail": "page origin does not match service",
+                "origin": origin,
+            }
+        )
 
     set_pending(
         session_key,
@@ -583,12 +727,12 @@ def handle_request_secret(args: dict, **kwargs: Any) -> str:
             "service": service,
             "target_id": target_id,
             "frame_id": frame_id,
-            "cdp_url": cdp_url,
+            "origin": origin,
             "created_at": time.time(),
         },
     )
 
-    question = f"Password for {service}. {_QUESTION}"
+    question = f"Password for {service} — it will be typed into {origin}. {_QUESTION}"
     callback = kwargs.get("callback")
     if callback is None:
         callback = _find_clarify_callback_from_stack()
@@ -652,9 +796,9 @@ def handle_request_secret(args: dict, **kwargs: Any) -> str:
         try:
             ok, detail = inject_secret(
                 response,
-                cdp_url=cdp_url or pending.get("cdp_url"),
                 target_id=target_id or pending.get("target_id"),
                 frame_id=frame_id or pending.get("frame_id"),
+                expected_origin=origin,
             )
         except Exception:
             ok, detail = False, "inject failed"

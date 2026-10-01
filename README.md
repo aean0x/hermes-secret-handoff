@@ -9,13 +9,15 @@ reach: the value flows human → CDP → page, and never lands in the session
 transcript, a log line, a tool result, or a file.
 
 ```
-request_secret(reason, url)
-  ├── stock clarify prompt      → human types the value
+request_secret(service, target_id?, frame_id?)
+  ├── CDP: resolve the target page and read its origin
+  │        → refuse unless the page host is `service` or a subdomain of it
+  ├── stock clarify prompt      → "Password for <service> — it will be typed
+  │                                into <origin>"; human types the value
   ├── classify reply            → "inject" | "cancel"  (cancel/n/no = cancel)
-  ├── close the clarifying turn → reply is not echoed back into the session
-  ├── CDP: pick the tab matching `url`, attach, fill the focused field,
-  │        submit on request, wait for the page's own result
-  └── return {"status": "injected", "target": "…"}   ← never the value
+  ├── CDP: re-check the live origin and that focus is on a password /
+  │        one-time-code input, then insert the value (no submit)
+  └── return {"status": "ok", "service": "…", "detail": "…"}   ← never the value
 ```
 
 ## Install
@@ -48,8 +50,10 @@ All optional; the endpoint falls back to the host's configured browser.
 | `SECRET_HANDOFF_TOOL_TIMEOUT_S` | `300` | Overall tool timeout; the human may take a while to paste. Always kept above the prompt budget. |
 | `HERMES_SESSION_KEY` | – | Session the pending request belongs to; set by Hermes. |
 
-Resolution order for the endpoint: explicit tool argument → `BROWSER_CDP_URL` →
-`browser.cdp_url` in `config.yaml` → `SECRET_HANDOFF_CDP_URL` → loopback `:9222`.
+Resolution order for the endpoint: `BROWSER_CDP_URL` → `browser.cdp_url` in
+`config.yaml` → `SECRET_HANDOFF_CDP_URL` → loopback `:9222`. The model cannot
+choose the endpoint, and the websocket the endpoint returns must stay on the
+same host (or loopback).
 
 ## When the prompt is not answered
 
@@ -82,8 +86,11 @@ it on its own timeout).
   code path that puts the value in the result, the log, or an exception
   message — the test suite asserts this for all four outcomes.
 - The clarifying prompt tells the human that their reply is not echoed back.
-- Injection is a websocket write to the page the human pointed at; the plugin
-  does not store the value, and does not read it back out of the DOM.
+- Injection is a websocket write to the page whose origin the prompt showed;
+  it is refused if the page's host does not match `service`, if the page
+  navigated to another origin before the reply, or if focus is not on a
+  password / one-time-code input. The plugin does not store the value, and
+  does not read it back out of the DOM.
 - Because it is a plugin tool, it is subject to the host's normal tool
   approval surface: disable the plugin and the tool disappears.
 
