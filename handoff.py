@@ -22,9 +22,7 @@ from urllib.request import Request, urlopen
 logger = logging.getLogger("hermes.plugins.secret_handoff")
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
-TOOL_TIMEOUT_S = 300.0
 PROMPT_TIMEOUT_S = 90.0
-_PROMPT_SLACK_S = 30.0
 _CDP_TIMEOUT_S = 8.0
 
 # Carried by a bounded failure so the caller changes surface instead of
@@ -159,40 +157,9 @@ def _find_clarify_callback_from_stack() -> Optional[Callable]:
     return None
 
 
-def _find_clarify_callback_on_heap(session_key: str) -> Optional[Callable]:
-    """Exact session-key match only. Never the first callable on the heap."""
-    if not session_key or session_key == "default":
-        return None
-    try:
-        import gc
-
-        for obj in gc.get_objects():
-            cb = _callback_from_agent(obj)
-            if cb is None:
-                continue
-            gsk = getattr(obj, "_gateway_session_key", None) or getattr(
-                obj, "gateway_session_key", None
-            )
-            sid = getattr(obj, "session_id", None)
-            if str(gsk or "") == session_key or str(sid or "") == session_key:
-                return cb
-    except Exception:
-        return None
-    return None
-
-
-def _find_clarify_callback(session_key: str) -> Optional[Callable]:
-    """Resolve the current turn's clarify callback.
-
-    Core ``clarify`` is special-cased in tool_executor.py with
-    ``callback=agent.clarify_callback``. Plugin tools are not, so recover the
-    same live agent from the call stack. A gc heap scan is last-resort and
-    only when it matches ``session_key`` exactly — never the first callable
-    on the heap (stale WebUI AIAgent objects return empty instantly).
-    """
-    return _find_clarify_callback_from_stack() or _find_clarify_callback_on_heap(
-        session_key
-    )
+# The former `gc.get_objects()` heap scan is gone: it read Hermes internals and
+# could return a stale AIAgent from a previous turn, whose callback answers
+# instantly with nothing.
 
 
 # ---------------------------------------------------------------------------
@@ -388,10 +355,18 @@ async def _wait_recv(ws: Any, remaining: float) -> str:
 
 
 def _eval_length_expr() -> str:
+    """Report the focused field's length, or -1 when the page cannot report it.
+
+    Contenteditable fields have no `.value`, and a framework-controlled input
+    can keep `.value` empty while the DOM shows text. -1 means "unreadable",
+    which the caller must not read as "empty", or it types the secret twice.
+    """
     return (
         "(function(){var el=document.activeElement;"
-        "if(!el||typeof el.value!=='string')return 0;"
-        "return el.value.length;})()"
+        "if(!el)return -1;"
+        "if(typeof el.value==='string')return el.value.length;"
+        "if(typeof el.textContent==='string')return el.textContent.length;"
+        "return -1;})()"
     )
 
 
@@ -408,16 +383,19 @@ def _eval_focus_expr() -> str:
 
 
 def _length_from_eval(result: Any) -> int:
+    """Field length from a CDP eval, or -1 when it could not be measured."""
     if not isinstance(result, dict):
-        return 0
+        return -1
     inner = result.get("result")
     if not isinstance(inner, dict):
-        return 0
+        return -1
     value = inner.get("value")
+    if value is None or isinstance(value, bool):
+        return -1
     try:
         return int(value)
     except (TypeError, ValueError):
-        return 0
+        return -1
 
 
 def _plan_target(
@@ -528,6 +506,15 @@ def inject_secret(
         length = _length_from_eval(results[-1] if results else None)
         if length > 0:
             return True, "injected"
+        if length < 0:
+            # The field cannot be measured (contenteditable, or a framework
+            # controlled input). The insert may well have landed, so retrying
+            # could type the secret twice: stop and say so honestly.
+            logger.warning(
+                "secret-handoff: inserted into %s but the field length is unreadable",
+                expected or "the target page",
+            )
+            return True, "injected"
         results = _run_async(
             _cdp_session_call(
                 ws_url,
@@ -537,7 +524,8 @@ def inject_secret(
             )
         )
         length = _length_from_eval(results[-1] if results else None)
-        if length > 0:
+        if length != 0:
+            # Non-empty, or unreadable after typing: never retried again.
             return True, "injected"
         return False, "field still empty"
     except _GuardRefused:
@@ -735,13 +723,14 @@ def handle_request_secret(args: dict, **kwargs: Any) -> str:
     question = f"Password for {service} — it will be typed into {origin}. {_QUESTION}"
     callback = kwargs.get("callback")
     if callback is None:
+        # Hermes passes `callback` to the built-in clarify tool but not to
+        # plugin tools, so recover the live agent from the call stack.
+        # Best-effort only: no heap scan, which could match a stale agent.
         callback = _find_clarify_callback_from_stack()
-        source = "stack"
-        if callback is None:
-            callback = _find_clarify_callback_on_heap(session_key)
-            source = "heap" if callback is not None else "none"
         logger.info(
-            "secret-handoff: clarify callback resolved via %s (session=%s)", source, session_key
+            "secret-handoff: clarify callback resolved via %s (session=%s)",
+            "stack" if callback is not None else "none",
+            session_key,
         )
 
     raw: Any = ""
@@ -827,10 +816,9 @@ def _register_tool(ctx: Any) -> None:
         "handler": handle_request_secret,
         "schema": REQUEST_SECRET_SCHEMA,
         "toolset": "plugin",
-        "timeout_s": max(
-            _env_float("SECRET_HANDOFF_TOOL_TIMEOUT_S", TOOL_TIMEOUT_S),
-            _prompt_timeout_s() + _PROMPT_SLACK_S,
-        ),
+        # No tool timeout is declared. register_tool() takes no such parameter,
+        # so the old knob did nothing: the host owns the call ceiling, and the
+        # prompt budget inside the handler bounds this tool's own wait.
         "description": REQUEST_SECRET_SCHEMA["description"],
         "emoji": "🔐",
     }
