@@ -1,5 +1,5 @@
 name: secret-handoff
-version: 0.3.3
+version: 0.3.4
 description: >-
   Ephemeral login paste: request_secret asks via stock clarify, injects the
   reply through a direct CDP websocket, and returns status only. The secret
@@ -8,5 +8,8 @@ description: >-
   Tune with BROWSER_CDP_URL / SECRET_HANDOFF_CDP_URL and the timeout knobs.
 author: aean0x
 kind: standalone
+requires_hermes: ">=0.21.5"
+python_dependencies:
+  - "websockets>=13,<16"
 provides_tools:
   - request_secret

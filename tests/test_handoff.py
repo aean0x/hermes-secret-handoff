@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -59,37 +60,24 @@ class ClassifyReply(unittest.TestCase):
 
 
 class FindClarifyCallback(unittest.TestCase):
-    def test_stack_walk_beats_stale_heap_object(self) -> None:
-        live = lambda *_a, **_k: "live"
-        stale = lambda *_a, **_k: "stale"
-        holder = types.SimpleNamespace(clarify_callback=stale, session_id="old")
+    def test_stack_walk_finds_the_live_agent(self) -> None:
+        live = lambda *_a, **_k: "live"  # noqa: E731
 
         class Agent:
             clarify_callback = staticmethod(live)
             session_id = "now"
 
         def outer():
-            agent = Agent()  # noqa: F841 — visible to stack walk
-            with patch("gc.get_objects", return_value=[holder]):
-                return h._find_clarify_callback("default")
+            agent = Agent()  # noqa: F841 — visible to the stack walk
+            return h._find_clarify_callback_from_stack()
 
-        found = outer()
-        self.assertIs(found, live)
+        self.assertIs(outer(), live)
 
-    def test_heap_skips_unmatched_when_session_is_default(self) -> None:
-        holder = types.SimpleNamespace(clarify_callback=lambda *_a, **_k: "pw")
-        with patch("gc.get_objects", return_value=[holder]):
-            found = h._find_clarify_callback_on_heap("default")
-        self.assertIsNone(found)
-
-    def test_exact_session_key_match_wins(self) -> None:
-        holder = types.SimpleNamespace(
-            clarify_callback=lambda *_a, **_k: "pw",
-            _gateway_session_key="real-session",
-        )
-        with patch("gc.get_objects", return_value=[holder]):
-            found = h._find_clarify_callback_on_heap("real-session")
-        self.assertIs(found, holder.clarify_callback)
+    def test_no_heap_scan_over_live_objects(self) -> None:
+        """The removed gc scan could hand back a stale agent's callback."""
+        source = (ROOT / "handoff.py").read_text(encoding="utf-8")
+        self.assertNotIn("import gc", source)
+        self.assertFalse(hasattr(h, "_find_clarify_callback_on_heap"))
 
 
 class PickTargetAndCdpUrl(unittest.TestCase):
@@ -315,6 +303,53 @@ class NeverReturnsSecret(unittest.TestCase):
         self.assertIsNone(h.peek_pending("cli"))
 
 
+class UnreadableFieldIsNotRetyped(unittest.TestCase):
+    """The insert must not repeat when the field cannot be measured.
+
+    A contenteditable has no `.value`, so the old probe read 0 and the
+    insertText-then-char fallback typed the secret a second time.
+    """
+
+    PLAN = {
+        "ws_url": "ws://127.0.0.1:9222/devtools/page/1",
+        "attach_id": "1",
+        "origin": "https://login.example.test",
+    }
+
+    def _inject(self, length_values):
+        calls: list[list[str]] = []
+        lengths = list(length_values)
+
+        async def fake_session(
+            ws_url, ops, *, attach_target_id=None, timeout=None, guard=None
+        ):
+            calls.append([op[0] for op in ops])
+            if guard is not None:
+                guard({"result": {"value": {"origin": self.PLAN["origin"], "field": True}}})
+            value = lengths.pop(0) if lengths else 0
+            return [{"result": {"value": value}}] * len(ops)
+
+        with (
+            patch.object(h, "_plan_target", return_value=(self.PLAN, "")),
+            patch.object(h, "_cdp_session_call", side_effect=fake_session),
+            patch.object(h, "_run_async", side_effect=lambda coro: asyncio.run(coro)),
+        ):
+            ok, detail = h.inject_secret("s3cret", expected_origin=self.PLAN["origin"])
+        return ok, detail, calls
+
+    def test_unreadable_length_is_not_retyped(self) -> None:
+        ok, detail, calls = self._inject([None])
+        self.assertEqual((ok, detail), (True, "injected"))
+        self.assertEqual(len(calls), 1, "no char fallback after an unreadable insert")
+        self.assertNotIn("Input.dispatchKeyEvent", calls[0])
+
+    def test_measurably_empty_field_uses_the_fallback_once(self) -> None:
+        ok, detail, calls = self._inject([0, 0])
+        self.assertEqual((ok, detail), (False, "field still empty"))
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Input.dispatchKeyEvent", calls[1])
+
+
 class BoundedPromptWait(unittest.TestCase):
     """A prompt that is raised but never answered must fail the tool, not the turn."""
 
@@ -418,9 +453,20 @@ class BoundedPromptWait(unittest.TestCase):
         self.assertTrue(entered.is_set())
         self.assertIsNone(h.peek_pending("webui-session"))
 
-    def test_tool_timeout_stays_above_the_prompt_budget(self) -> None:
+    def test_no_tool_timeout_is_declared(self) -> None:
+        """register_tool() has no timeout parameter, so the knob is gone."""
+        captured: dict = {}
+
+        class Ctx:
+            def register_tool(self, **kwargs):
+                captured.update(kwargs)
+
+        h._register_tool(Ctx())
+        self.assertEqual(captured["name"], "request_secret")
+        self.assertNotIn("timeout_s", captured)
+
+    def test_prompt_budget_is_still_honoured(self) -> None:
         with patch.dict(os.environ, {"SECRET_HANDOFF_PROMPT_TIMEOUT_S": "600"}):
-            self.assertGreater(h._prompt_timeout_s() + h._PROMPT_SLACK_S, 600.0)
             self.assertEqual(h._prompt_timeout_s(), 600.0)
 
     def test_fallback_hint_is_host_supplied_when_set(self) -> None:

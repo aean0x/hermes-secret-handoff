@@ -5,8 +5,14 @@ the human for a credential, types the answer into a live browser over CDP, and
 returns **status only**.
 
 Use it when the agent has to log into something and no password manager is in
-reach: the value flows human → CDP → page, and never lands in the session
-transcript, a log line, a tool result, or a file.
+reach: the value flows human → CDP → page, and never reaches the tool result,
+a file, or the transcript the agent reads back.
+
+The question itself is an ordinary free-text `clarify` prompt, so it is only as
+private as the surface showing it: in the CLI the answer appears in scrollback,
+and on a messaging platform it is a normal chat message that stays in that
+platform's history. Hermes offers no masked prompt to plugins here, so prefer a
+password manager, or answer on a surface you accept will hold the value.
 
 ```
 request_secret(service, target_id?, frame_id?)
@@ -47,7 +53,6 @@ All optional; the endpoint falls back to the host's configured browser.
 | `SECRET_HANDOFF_CDP_TIMEOUT_S` | `8` | Per-websocket open/timeout budget for one injection. |
 | `SECRET_HANDOFF_PROMPT_TIMEOUT_S` | `90` | How long one clarify prompt may take before the tool gives up and reports `no_response`. `0` disables the cap. |
 | `SECRET_HANDOFF_FALLBACK_HINT` | – | Host-supplied pointer carried by a bounded failure, so the caller knows which surface to switch to. |
-| `SECRET_HANDOFF_TOOL_TIMEOUT_S` | `300` | Overall tool timeout; the human may take a while to paste. Always kept above the prompt budget. |
 | `HERMES_SESSION_KEY` | – | Session the pending request belongs to; set by Hermes. |
 
 Resolution order for the endpoint: `BROWSER_CDP_URL` → `browser.cdp_url` in
@@ -91,8 +96,9 @@ it on its own timeout).
   navigated to another origin before the reply, or if focus is not on a
   password / one-time-code input. The plugin does not store the value, and
   does not read it back out of the DOM.
-- Because it is a plugin tool, it is subject to the host's normal tool
-  approval surface: disable the plugin and the tool disappears.
+- It is a plugin tool, so it has no default approval gate of its own. The gate
+  is the prompt: nothing is typed unless a human answers it, and disabling the
+  plugin removes the tool.
 
 ## Tests
 
