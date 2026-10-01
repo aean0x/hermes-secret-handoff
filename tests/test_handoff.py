@@ -132,9 +132,17 @@ class PickTargetAndCdpUrl(unittest.TestCase):
             self.assertEqual(h.resolve_cdp_http_base(None), "http://localhost:9222")
 
 
+def _patch_page(test: unittest.TestCase, origin: str = "https://example.com") -> None:
+    """Stand in for the live CDP target the handler binds the prompt to."""
+    patcher = patch.object(h, "describe_target", return_value=(True, origin))
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
+
 class NeverReturnsSecret(unittest.TestCase):
     def setUp(self) -> None:
         h.reset_state()
+        _patch_page(self)
 
     def tearDown(self) -> None:
         h.reset_state()
@@ -156,12 +164,12 @@ class NeverReturnsSecret(unittest.TestCase):
         ):
             _install_clarify(fake_clarify)
             out = h.handle_request_secret(
-                {"service": "ticketmaster"},
+                {"service": "example.com"},
                 callback=lambda *_a, **_k: secret,
             )
         data = json.loads(out)
         self.assertEqual(data["status"], "ok")
-        self.assertEqual(data["service"], "ticketmaster")
+        self.assertEqual(data["service"], "example.com")
         self.assertEqual(data["detail"], "cdp Input.insertText")
         self.assertEqual(captured, [secret])
         self.assertNotIn(secret, out)
@@ -296,7 +304,7 @@ class NeverReturnsSecret(unittest.TestCase):
         ):
             _install_clarify(fake_clarify)
             out = h.handle_request_secret(
-                {"service": "bank"},
+                {"service": "example.com"},
                 callback=lambda *_a, **_k: secret,
             )
         data = json.loads(out)
@@ -312,6 +320,7 @@ class BoundedPromptWait(unittest.TestCase):
 
     def setUp(self) -> None:
         h.reset_state()
+        _patch_page(self)
 
     def tearDown(self) -> None:
         h.reset_state()
@@ -337,7 +346,7 @@ class BoundedPromptWait(unittest.TestCase):
             patch.object(h, "inject_secret", side_effect=fake_inject),
         ):
             _install_clarify(hanging_clarify)
-            out = h.handle_request_secret({"service": "check24.de"})
+            out = h.handle_request_secret({"service": "example.com"})
         elapsed = time.monotonic() - started
 
         data = json.loads(out)
@@ -366,7 +375,7 @@ class BoundedPromptWait(unittest.TestCase):
             patch.object(h, "inject_secret", side_effect=fake_inject),
         ):
             _install_clarify(fake_clarify)
-            out = h.handle_request_secret({"service": "check24.de"})
+            out = h.handle_request_secret({"service": "example.com"})
 
         data = json.loads(out)
         self.assertEqual(data["status"], "ok")
@@ -398,13 +407,13 @@ class BoundedPromptWait(unittest.TestCase):
             patch.object(h, "inject_secret", side_effect=AssertionError("no reply, no inject")),
         ):
             _install_clarify(clarify_via_callback)
-            out = h.handle_request_secret({"service": "check24.de"})
+            out = h.handle_request_secret({"service": "example.com"})
         elapsed = time.monotonic() - started
 
         data = json.loads(out)
         self.assertEqual(data["status"], "failed")
         self.assertEqual(data["detail"], "no_response")
-        self.assertEqual(data["service"], "check24.de")
+        self.assertEqual(data["service"], "example.com")
         self.assertLess(elapsed, 20.0)
         self.assertTrue(entered.is_set())
         self.assertIsNone(h.peek_pending("webui-session"))
@@ -431,6 +440,69 @@ class BoundedPromptWait(unittest.TestCase):
         self.assertFalse(timed_out)
         self.assertIn("x", raw)
         self.assertLess(time.monotonic() - started, 5.0)
+
+
+class EndpointAndOriginBinding(unittest.TestCase):
+    """The model must not choose where the secret goes."""
+
+    def setUp(self) -> None:
+        h.reset_state()
+
+    def test_no_model_endpoint_and_lookalike_origin_is_refused_before_prompting(self) -> None:
+        self.assertNotIn("cdp_url", h.REQUEST_SECRET_SCHEMA["parameters"]["properties"])
+        with patch.object(h, "_http_json", side_effect=AssertionError("no fetch")):
+            plan, detail = h._plan_target("http://attacker.example:9222")
+        self.assertIsNone(plan)
+        self.assertEqual(detail, "cdp endpoint not allowed")
+
+        asked: list = []
+        with (
+            patch.object(h, "resolve_session_key_for_tool", return_value="cli"),
+            patch.object(
+                h, "describe_target", return_value=(True, "https://github.com.attacker.example")
+            ),
+            patch.object(h, "inject_secret", side_effect=AssertionError("no inject")),
+        ):
+            _install_clarify(lambda **kw: asked.append(kw))
+            out = h.handle_request_secret(
+                {"service": "github.com", "cdp_url": "http://attacker.example:9222"}
+            )
+        data = json.loads(out)
+        self.assertEqual(data["status"], "failed")
+        self.assertEqual(data["detail"], "page origin does not match service")
+        self.assertEqual(asked, [])
+        self.assertTrue(h.origin_matches_service("https://login.github.com", "github.com"))
+
+    def test_current_clarify_signature_and_shape_inject_on_the_shown_origin(self) -> None:
+        secret = _sentinel("questions-api")
+        asked: list = []
+        captured: list = []
+
+        def clarify_tool(questions, callback=None):  # current Hermes signature
+            asked.append(questions)
+            return json.dumps(
+                {
+                    "responses": [{"question": "q", "status": "answered", "user_response": secret}],
+                    "outcome": "submitted",
+                }
+            )
+
+        def fake_inject(text: str, **kwargs) -> tuple[bool, str]:
+            captured.append((text, kwargs.get("expected_origin")))
+            return True, "injected"
+
+        with (
+            patch.object(h, "resolve_session_key_for_tool", return_value="cli"),
+            patch.object(h, "describe_target", return_value=(True, "https://github.com")),
+            patch.object(h, "inject_secret", side_effect=fake_inject),
+        ):
+            _install_clarify(clarify_tool)
+            out = h.handle_request_secret({"service": "github.com"})
+        data = json.loads(out)
+        self.assertEqual(data["status"], "ok", data)
+        self.assertIn("https://github.com", asked[0][0]["question"])
+        self.assertEqual(captured, [(secret, "https://github.com")])
+        self.assertNotIn(secret, out)
 
 
 if __name__ == "__main__":
