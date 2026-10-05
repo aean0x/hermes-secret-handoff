@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -57,6 +58,40 @@ class ClassifyReply(unittest.TestCase):
     def test_classify_ignore_slash(self) -> None:
         self.assertEqual(h.classify_reply("/stop"), "ignore")
         self.assertEqual(h.classify_reply("/new"), "ignore")
+
+
+class DeclaredHermesFloor(unittest.TestCase):
+    """The manifest floor must not exclude hosts the runtime shim supports.
+
+    ``_clarify_with_deadline`` probes ``clarify_tool`` and calls ``questions=``
+    on current Hermes or ``question=``/``choices=`` on older builds, so a floor
+    set at the release that introduced the new signature (0.21.5) would refuse
+    hosts the plugin runs on. 0.21.1 is the release the fallback path is
+    exercised against, so that is what the manifest declares.
+    """
+
+    def test_declared_floor_matches_the_runtime_shim(self) -> None:
+        manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        match = re.search(r'^requires_hermes:\s*"?([^"\n]+)"?\s*$', manifest, re.M)
+        self.assertIsNotNone(match, "plugin.yaml declares no requires_hermes")
+        assert match is not None  # narrow for the type checker
+        self.assertEqual(
+            match.group(1).strip(),
+            ">=0.21.1",
+            "raise the floor only if the older-shape fallback in "
+            "_clarify_with_deadline is gone: a floor at the new-signature "
+            "release blocks hosts the shim still serves",
+        )
+
+    def test_shape_probe_detects_both_signatures(self) -> None:
+        def current(questions=None, callback=None):  # noqa: ANN001, ANN202
+            return None
+
+        def older(question=None, choices=None, callback=None):  # noqa: ANN001, ANN202
+            return None
+
+        self.assertTrue(h._takes_questions(current))
+        self.assertFalse(h._takes_questions(older))
 
 
 class FindClarifyCallback(unittest.TestCase):
