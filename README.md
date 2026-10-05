@@ -38,6 +38,10 @@ add `secret-handoff` to `plugins.enabled` in `config.yaml`, and restart.
 
 ## Requirements
 
+- Hermes 0.21.1 or newer. The tool probes the host's clarify call and adapts:
+  current releases take `questions=[...]`, older ones `question=`/`choices=`.
+  The new signature first ships in 0.21.5, and the fallback is why the declared
+  floor sits below it.
 - A browser already running with a CDP endpoint (the same one the agent's
   browser tools use), reachable from the Hermes process.
 - The `websockets` package, which Hermes' browser tooling already installs.
