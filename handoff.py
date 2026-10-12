@@ -22,7 +22,7 @@ from urllib.request import Request, urlopen
 logger = logging.getLogger("hermes.plugins.secret_handoff")
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
-PROMPT_TIMEOUT_S = 90.0
+PROMPT_TIMEOUT_S = 300.0
 _CDP_TIMEOUT_S = 8.0
 
 # Carried by a bounded failure so the caller changes surface instead of
