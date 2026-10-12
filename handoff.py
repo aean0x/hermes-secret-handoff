@@ -641,11 +641,40 @@ def _prompt_timeout_s() -> float:
 
 
 def _takes_questions(fn: Callable) -> bool:
-    """Current Hermes clarify takes ``questions=[...]``; older releases ``question=``."""
+    """Host exposes the batch parameter (0.21.x keeps it optional alongside ``question``)."""
     try:
         return "questions" in inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
+
+
+def _question_is_required(fn: Callable) -> bool:
+    """Whether ``question`` has no default, so a batch call must still pass it.
+
+    0.21.x adds ``questions`` *next to* a mandatory ``question``: calling with
+    ``questions=`` alone raises TypeError. The batch-only shape
+    (``clarify_tool(questions, callback)``) has no ``question`` parameter at all.
+    """
+    try:
+        parameter = inspect.signature(fn).parameters.get("question")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.default is inspect.Parameter.empty
+
+
+def _call_clarify(clarify_tool: Callable, question: str, callback: Optional[Callable]) -> Any:
+    """Call the host's clarify with the arguments THAT signature accepts.
+
+    Three shapes are live: ``(questions, callback)`` (batch-only),
+    ``(question, choices, multi_select, questions, callback)`` (0.21.x, where
+    ``question`` is still required) and ``(question, choices, callback)``.
+    """
+    if not _takes_questions(clarify_tool):
+        return clarify_tool(question=question, choices=None, callback=callback)
+    kwargs: dict[str, Any] = {"questions": [{"question": question}], "callback": callback}
+    if _question_is_required(clarify_tool):
+        kwargs["question"] = question
+    return clarify_tool(**kwargs)
 
 
 def _clarify_with_deadline(
@@ -666,10 +695,7 @@ def _clarify_with_deadline(
 
     def _ask() -> None:
         try:
-            if _takes_questions(clarify_tool):
-                result["raw"] = clarify_tool(questions=[{"question": question}], callback=callback)
-            else:  # older Hermes: clarify_tool(question, choices, callback)
-                result["raw"] = clarify_tool(question=question, choices=None, callback=callback)
+            result["raw"] = _call_clarify(clarify_tool, question, callback)
         except BaseException as exc:  # re-raised on the caller's thread
             result["error"] = exc
 
@@ -740,8 +766,11 @@ def handle_request_secret(args: dict, **kwargs: Any) -> str:
             raw, prompt_timed_out = _clarify_with_deadline(
                 question, callback, _prompt_timeout_s()
             )
-        except Exception:
-            logger.warning("secret-handoff: clarify_tool failed")
+        except Exception as exc:
+            logger.warning(
+                "secret-handoff: clarify_tool failed: %s: %s", type(exc).__name__, exc,
+                exc_info=True,
+            )
             return json.dumps(
                 {"status": "failed", "service": service, "detail": "clarify unavailable"}
             )

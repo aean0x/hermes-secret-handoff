@@ -63,11 +63,11 @@ class ClassifyReply(unittest.TestCase):
 class DeclaredHermesFloor(unittest.TestCase):
     """The manifest floor must not exclude hosts the runtime shim supports.
 
-    ``_clarify_with_deadline`` probes ``clarify_tool`` and calls ``questions=``
-    on current Hermes or ``question=``/``choices=`` on older builds, so a floor
-    set at the release that introduced the new signature (0.21.5) would refuse
-    hosts the plugin runs on. 0.21.1 is the release the fallback path is
-    exercised against, so that is what the manifest declares.
+    ``_clarify_with_deadline`` inspects the host's ``clarify_tool`` signature
+    and passes whichever of ``question``/``questions`` that signature needs, so
+    a floor set at the release that introduced the batch parameter (0.21.5)
+    would refuse hosts the plugin runs on. 0.21.1 is the release the single
+    question path is exercised against, so that is what the manifest declares.
     """
 
     def test_declared_floor_matches_the_runtime_shim(self) -> None:
@@ -84,14 +84,109 @@ class DeclaredHermesFloor(unittest.TestCase):
         )
 
     def test_shape_probe_detects_both_signatures(self) -> None:
-        def current(questions=None, callback=None):  # noqa: ANN001, ANN202
+        def batch_only(questions=None, callback=None):  # noqa: ANN001, ANN202
             return None
 
-        def older(question=None, choices=None, callback=None):  # noqa: ANN001, ANN202
+        def pre_batch(question=None, choices=None, callback=None):  # noqa: ANN001, ANN202
             return None
 
-        self.assertTrue(h._takes_questions(current))
-        self.assertFalse(h._takes_questions(older))
+        self.assertTrue(h._takes_questions(batch_only))
+        self.assertFalse(h._takes_questions(pre_batch))
+
+    def test_required_question_is_detected(self) -> None:
+        """0.21.x adds ``questions`` but does NOT relax ``question``."""
+
+        def zero_two_one_x(  # noqa: ANN001, ANN202
+            question, choices=None, multi_select=False, questions=None, callback=None
+        ):
+            return None
+
+        def batch_only(questions, callback=None):  # noqa: ANN001, ANN202
+            return None
+
+        self.assertTrue(h._takes_questions(zero_two_one_x))
+        self.assertTrue(h._question_is_required(zero_two_one_x))
+        self.assertFalse(h._question_is_required(batch_only))
+
+
+class ClarifySignatureShapes(unittest.TestCase):
+    """Every live ``clarify_tool`` shape must reach the user.
+
+    A questions-only call against 0.21.x raises ``TypeError: missing 1 required
+    positional argument: 'question'`` inside the plugin's prompt thread, which
+    the caller turns into ``detail: clarify unavailable`` in a few milliseconds.
+    """
+
+    def _responses(self, value: str) -> str:
+        return json.dumps({"responses": [{"user_response": value}], "outcome": "answered"})
+
+    def test_021x_keeps_question_required_on_the_batch_call(self) -> None:
+        calls: dict[str, object] = {}
+
+        def host_clarify(  # noqa: ANN001
+            question, choices=None, multi_select=False, questions=None, callback=None
+        ):
+            assert callback is not None
+            calls.update(question=question, questions=questions)
+            return self._responses(callback(question, choices))
+
+        _install_clarify(host_clarify)
+        raw, timed_out = h._clarify_with_deadline(
+            "Password for example.com?", lambda q, c, multi_select=False: "s3cret", 5
+        )
+        self.assertFalse(timed_out)
+        self.assertEqual(h._extract_clarify_response(raw), "s3cret")
+        self.assertEqual(calls["question"], "Password for example.com?")
+        self.assertEqual(calls["questions"], [{"question": "Password for example.com?"}])
+
+    def test_batch_only_signature_still_gets_questions_alone(self) -> None:
+        def host_clarify(questions, callback=None):  # noqa: ANN001
+            assert callback is not None
+            return self._responses(callback(questions[0]["question"], None))
+
+        _install_clarify(host_clarify)
+        raw, timed_out = h._clarify_with_deadline(
+            "Password for example.com?", lambda q, c, multi_select=False: "s3cret", 5
+        )
+        self.assertFalse(timed_out)
+        self.assertEqual(h._extract_clarify_response(raw), "s3cret")
+
+    def test_pre_batch_signature_uses_the_single_question_path(self) -> None:
+        seen: list[str] = []
+
+        def host_clarify(question, choices=None, callback=None):  # noqa: ANN001
+            assert callback is not None
+            seen.append(question)
+            return self._responses(callback(question, choices))
+
+        _install_clarify(host_clarify)
+        raw, timed_out = h._clarify_with_deadline(
+            "Password for example.com?", lambda q, c, multi_select=False: "s3cret", 5
+        )
+        self.assertFalse(timed_out)
+        self.assertEqual(h._extract_clarify_response(raw), "s3cret")
+        self.assertEqual(seen, ["Password for example.com?"])
+
+    def test_handler_names_the_cause_of_a_rejected_call(self) -> None:
+        """The user-visible symptom is the fast ``clarify unavailable``; the log must name why."""
+
+        def host_clarify(  # noqa: ANN001
+            question, choices=None, multi_select=False, questions=None, callback=None
+        ):
+            raise TypeError("clarify_tool() missing 1 required positional argument: 'question'")
+
+        _patch_page(self)
+        _install_clarify(host_clarify)
+        with patch.object(h, "resolve_session_key_for_tool", return_value="sess"):
+            with self.assertLogs(h.logger.name, level="WARNING") as captured:
+                out = h.handle_request_secret(
+                    {"service": "example.com"},
+                    callback=lambda *_a, **_k: "x",
+                )
+        self.assertEqual(json.loads(out)["detail"], "clarify unavailable")
+        self.assertIn("missing 1 required positional argument", "\n".join(captured.output))
+        self.assertIn("TypeError", "\n".join(captured.output))
+        self.assertIsNone(h.peek_pending("sess"))
 
 
 class FindClarifyCallback(unittest.TestCase):
